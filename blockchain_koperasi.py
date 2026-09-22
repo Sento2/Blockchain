@@ -1,550 +1,649 @@
-"""
-Tugas Besar - Rekayasa Ulang Praktikum I: Blockchain Permissioned
-untuk Jaringan Konsorsium Koperasi Simpan Pinjam
+"""Praktikum 1 - Blockchain Permissioned Koperasi (versi perbaikan).
 
-Versi 2: melengkapi 3 hal dari versi sebelumnya agar makin ketat mengikuti
-"Laporan Desain Jaringan Blockchain untuk Industri Finansial":
-  1. Field transaksi selengkap Bagian 1.3 (saldo sebelum/sesudah, loan_id)
-  2. ObserverNode & Auditor sebagai objek terpisah (read-only, sesuai Bagian 1.2)
-  3. previous_hash ditautkan lewat fungsi terpisah link_block(), meniru pola
-     assignment terpisah pada Kode 1.13 modul praktikum (bukan langsung
-     dimasukkan saat Block() dibuat)
+JALANKAN:
+    python -m pip install cryptography
+    python blockchain_koperasi.py              # presentasi/demo koperasi
+    python blockchain_koperasi.py --test       # uji regresi otomatis
+    python blockchain_koperasi.py --pow-demo   # latihan PoW modul, terpisah
+
+PADANAN MODUL:
+    class Block; link_block (parent hash); replay_chain (deteksi manipulasi);
+    Wallet/Transaction (private-public key, sign-verify); mine_pow (nonce).
+
+CAKUPAN: simulasi authority-based dengan 4 validator, kuorum 3 tanda tangan
+unik. Setiap validator memeriksa kandidat terhadap salinan chain sendiri.
+BUKAN protokol IBFT lengkap: belum ada pesan prepare/commit, round-change,
+transport jaringan, atau jaminan BFT produksi. Semua node berjalan dalam satu
+proses lokal. Library kriptografi digunakan seperti pada modul praktikum.
+
+ATURAN BISNIS DEMO:
+- Nominal integer rupiah, positif; tanpa bunga/denda/biaya transaksi.
+- Pencairan menambah saldo simpanan sebesar pokok pinjaman yang disetujui.
+- Angsuran adalah pembayaran tunai eksternal: mengurangi sisa utang, tidak
+  mendebit saldo simpanan. Setiap pembayaran mengurangi tenor satu periode;
+  angsuran periode terakhir harus melunasi sisa utang.
+- loan_approval ditambahkan sebagai transaksi agar persetujuan dapat diaudit.
+- Genesis kosong ditandatangani 4 validator. Nonce block authority bernilai
+  None: tidak digunakan karena tidak ada penambangan PoW di alur utama.
+
+BATASAN/TARGET TUGAS BESAR: penyimpanan permanen, keystore terenkripsi,
+rotasi/pencabutan kunci melalui tata kelola, jaringan antarnode, IBFT lengkap,
+UI dan SPV. Whitelist tetap selama satu sesi; seluruh kunci/data di memori.
+Salinan observer terpisah dan antarmuka baca mengembalikan deepcopy, tetapi
+bukan isolasi keamanan terhadap orang yang menguasai proses Python.
 """
 
+import argparse
+import copy
 import hashlib
 import json
 import time
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.exceptions import InvalidSignature
+import unittest
+import uuid
+from dataclasses import dataclass, field
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+except ImportError:
+    raise SystemExit('Pasang dependensi: python -m pip install cryptography')
+
+VALIDATOR_NAMES = ('Pengurus Pusat', 'Pengurus Koperasi',
+                   'Pengurus Pengawas', 'Otoritas Konsorsium')
+QUORUM = 3                         # jumlah total tetap 4, bukan node online
+NETWORK = 'koperasi-praktikum-1'
+ZERO_HASH = '0' * 64
 
 
-# ============================================================
-# 1. PEMBANGKITAN KUNCI (kriptografi kurva eliptik / ECC)
-# ============================================================
-def generate_keypair():
-    private_key = ec.generate_private_key(ec.SECP256R1())
-    public_key = private_key.public_key()
-    return private_key, public_key
+def canonical(data):
+    """Serialisasi deterministik: objek sama menghasilkan byte yang sama."""
+    return json.dumps(data, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=False, allow_nan=False).encode('utf-8')
 
 
-def pubkey_to_pem(public_key):
-    return public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode()
+def digest(data):
+    return hashlib.sha256(canonical(data)).hexdigest()
 
 
-VALIDATOR_NAMES = [
-    "Pengurus Pusat",
-    "Pengurus Koperasi",
-    "Pengurus Pengawas",
-    "Otoritas Konsorsium",
-]
-
-validators = {}
-for name in VALIDATOR_NAMES:
-    priv, pub = generate_keypair()
-    validators[name] = {"private": priv, "public": pub}
-
-teller_private, teller_public = generate_keypair()
-rogue_private, rogue_public = generate_keypair()
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
 
 
-# ============================================================
-# 2. PERMISSION LIST (Whitelist Public Key)
-# ============================================================
-permission_list = {}
+class Wallet:
+    def __init__(self):
+        self._private = ec.generate_private_key(ec.SECP256R1())
+
+    @property
+    def public_pem(self):
+        return self._private.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo).decode()
+
+    def sign(self, payload):
+        # ECDSA meng-hash payload SATU kali menggunakan SHA-256.
+        return self._private.sign(payload, ec.ECDSA(hashes.SHA256())).hex()
 
 
-def register_operator(operator_id, public_key):
-    permission_list[operator_id] = pubkey_to_pem(public_key)
+def verify(public_pem, signature, payload):
+    try:
+        public = serialization.load_pem_public_key(public_pem.encode())
+        public.verify(bytes.fromhex(signature), payload, ec.ECDSA(hashes.SHA256()))
+        return True
+    except (InvalidSignature, ValueError, TypeError, AttributeError):
+        return False
 
 
-def is_registered(operator_id):
-    return operator_id in permission_list
-
-
-register_operator("TELLER-01", teller_public)
-
-
-# ============================================================
-# 3. "SALINAN LEDGER LOKAL" PARTICIPANT NODE
-#    dipakai untuk cek saldo & status pinjaman (Bagian 4.3 poin 1)
-# ============================================================
-member_balances = {}
-loans = {}
-_loan_counter = [1]
-
-
-def get_balance(member_id):
-    return member_balances.get(member_id, 0)
-
-
-def next_loan_id():
-    loan_id = f"PINJ-{_loan_counter[0]:03d}"
-    _loan_counter[0] += 1
-    return loan_id
-
-
-def approve_loan(loan_id):
-    """Persetujuan pinjaman oleh Operator berwenang - state internal,
-    dilakukan sebelum pencairan (Bagian 1.3 laporan: 'Pencairan pinjaman
-    dieksekusi setelah pengajuan disetujui')."""
-    if loan_id in loans:
-        loans[loan_id]["status"] = "disetujui"
-
-
-# ============================================================
-# 4. TRANSAKSI - field selengkap Bagian 1.3 laporan
-# ============================================================
+@dataclass
 class Transaction:
-    def __init__(self, tx_type, member_id, amount, operator_id, extra=None):
-        self.tx_type = tx_type
-        self.member_id = member_id
-        self.amount = amount
-        self.operator_id = operator_id
-        self.timestamp = time.time()
-        self.extra = extra or {}
-        self.signature = None
+    tx_type: str
+    member_id: str
+    amount: int
+    operator_id: str
+    extra: dict = field(default_factory=dict)
+    timestamp: int = field(default_factory=lambda: int(time.time()))
+    tx_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    network: str = NETWORK
+    signature: str = ''
 
-    def _payload(self):
-        payload = {
-            "tx_type": self.tx_type,
-            "member_id": self.member_id,
-            "amount": self.amount,
-            "operator_id": self.operator_id,
-            "timestamp": self.timestamp,
-            "extra": self.extra,
-        }
-        return json.dumps(payload, sort_keys=True).encode("utf-8")
+    def payload(self):
+        return {k: copy.deepcopy(v) for k, v in vars(self).items() if k != 'signature'}
 
-    def payload_hash(self):
-        return hashlib.sha256(self._payload()).digest()
-
-    def sign(self, private_key):
-        self.signature = private_key.sign(self.payload_hash(), ec.ECDSA(hashes.SHA256()))
-
-    def verify_signature(self, public_key):
-        if self.signature is None:
-            return False
-        try:
-            public_key.verify(self.signature, self.payload_hash(), ec.ECDSA(hashes.SHA256()))
-            return True
-        except InvalidSignature:
-            return False
+    def sign(self, wallet):
+        self.signature = wallet.sign(canonical(self.payload()))
+        return self
 
     def to_dict(self):
-        return {
-            "tx_type": self.tx_type,
-            "member_id": self.member_id,
-            "amount": self.amount,
-            "operator_id": self.operator_id,
-            "timestamp": self.timestamp,
-            "extra": self.extra,
-            "signature": self.signature.hex() if self.signature else None,
-        }
+        return copy.deepcopy(vars(self))
 
 
-# ---- Helper pembuatan transaksi per jenis, mengisi field sesuai Bagian 1.3 ----
-def make_deposit(member_id, amount, operator_id, private_key):
-    """Setoran simpanan - ID Anggota, nominal, timestamp."""
-    tx = Transaction("deposit", member_id, amount, operator_id)
-    tx.sign(private_key)
-    return tx
+@dataclass
+class State:
+    balances: dict = field(default_factory=dict)
+    loans: dict = field(default_factory=dict)
+    seen: set = field(default_factory=set)
 
 
-def make_withdrawal(member_id, amount, operator_id, private_key):
-    """Penarikan simpanan - ID Anggota, nominal, saldo sebelum/sesudah."""
-    saldo_sebelum = get_balance(member_id)
-    tx = Transaction("withdrawal", member_id, amount, operator_id, extra={
-        "saldo_sebelum": saldo_sebelum,
-        "saldo_sesudah": saldo_sebelum - amount,
-    })
-    tx.sign(private_key)
-    return tx
+def apply_transaction(tx, state, permission_list):
+    """Validasi lalu ubah STATE KERJA saja; tidak menyentuh saldo final.
 
-
-def make_loan_request(member_id, amount, tenor_bulan, operator_id, private_key):
-    """Pengajuan pinjaman - ID Anggota, nominal pinjaman, tenor, status persetujuan."""
-    loan_id = next_loan_id()
-    tx = Transaction("loan_request", member_id, amount, operator_id, extra={
-        "loan_id": loan_id,
-        "tenor_bulan": tenor_bulan,
-        "status": "diajukan",
-    })
-    tx.sign(private_key)
-    return tx
-
-
-def make_loan_disbursement(member_id, amount, loan_id, operator_id, private_key):
-    """Pencairan pinjaman - dieksekusi setelah pengajuan disetujui Operator berwenang."""
-    tx = Transaction("loan_disbursement", member_id, amount, operator_id, extra={
-        "loan_id": loan_id,
-    })
-    tx.sign(private_key)
-    return tx
-
-
-def make_installment(member_id, loan_id, amount, sisa_tenor, operator_id, private_key):
-    """Pembayaran angsuran - ID pinjaman terkait, nominal angsuran, sisa tenor."""
-    tx = Transaction("installment_payment", member_id, amount, operator_id, extra={
-        "loan_id": loan_id,
-        "sisa_tenor": sisa_tenor,
-    })
-    tx.sign(private_key)
-    return tx
-
-
-def participant_node_verify(tx, signer_public_key):
+    Public key wajib berasal dari whitelist, tidak diterima dari pemanggil.
+    Dipakai ulang oleh participant, validator, dan auditor saat replay.
     """
-    Simulasi Participant Node (Bagian 4.3): verifikasi signature, cek whitelist,
-    cek saldo/status akun terhadap salinan ledger lokal, baru diteruskan ke Mempool.
-    """
-    if not is_registered(tx.operator_id):
-        return False, "DITOLAK: operator_id tidak terdaftar di Permission List (whitelist)"
-    if not tx.verify_signature(signer_public_key):
-        return False, "DITOLAK: signature tidak valid"
+    require(isinstance(tx, Transaction), 'Format transaksi salah')
+    require(tx.network == NETWORK, 'Network transaksi tidak sesuai')
+    require(isinstance(tx.tx_id, str) and len(tx.tx_id) == 32, 'tx_id tidak valid')
+    require(tx.tx_id not in state.seen, 'Transaksi duplikat/replay')
+    require(isinstance(tx.operator_id, str) and tx.operator_id in permission_list,
+            'Operator tidak terdaftar')
+    require(verify(permission_list[tx.operator_id], tx.signature, canonical(tx.payload())),
+            'Signature tidak valid untuk operator terdaftar')
+    require(isinstance(tx.member_id, str) and bool(tx.member_id.strip()), 'ID anggota kosong')
+    require(type(tx.amount) is int and tx.amount > 0, 'Nominal harus integer positif')
+    require(type(tx.timestamp) is int and tx.timestamp >= 0, 'Timestamp harus integer')
+    require(isinstance(tx.extra, dict), 'Extra harus dictionary')
+    schemas = {
+        'deposit': set(), 'withdrawal': {'saldo_sebelum', 'saldo_sesudah'},
+        'loan_request': {'loan_id', 'tenor_bulan', 'status'},
+        'loan_approval': {'loan_id'}, 'loan_disbursement': {'loan_id'},
+        'installment_payment': {'loan_id', 'sisa_tenor'},
+    }
+    require(tx.tx_type in schemas, 'Jenis transaksi tidak dikenal')
+    require(set(tx.extra) == schemas[tx.tx_type], 'Field transaksi tidak sesuai skema')
+    balance = state.balances.get(tx.member_id, 0)
+    loan_id = tx.extra.get('loan_id')
+    if loan_id is not None:
+        require(isinstance(loan_id, str) and bool(loan_id.strip()), 'ID pinjaman salah')
 
-    if tx.tx_type == "withdrawal" and get_balance(tx.member_id) < tx.amount:
-        return False, "DITOLAK: saldo tidak mencukupi"
+    if tx.tx_type == 'deposit':
+        state.balances[tx.member_id] = balance + tx.amount
+    elif tx.tx_type == 'withdrawal':
+        require(balance >= tx.amount, 'Saldo tidak cukup')
+        require(all(type(tx.extra[k]) is int for k in ('saldo_sebelum', 'saldo_sesudah')),
+                'Field saldo harus integer')
+        require(tx.extra['saldo_sebelum'] == balance and
+                tx.extra['saldo_sesudah'] == balance - tx.amount, 'Metadata saldo tidak cocok')
+        state.balances[tx.member_id] = balance - tx.amount
+    elif tx.tx_type == 'loan_request':
+        require(loan_id not in state.loans, 'ID pinjaman sudah ada')
+        tenor = tx.extra['tenor_bulan']
+        require(type(tenor) is int and tenor > 0, 'Tenor harus integer positif')
+        require(tx.extra['status'] == 'diajukan', 'Status awal harus diajukan')
+        state.loans[loan_id] = dict(member_id=tx.member_id, amount=tx.amount,
+                                   outstanding=tx.amount, sisa_tenor=tenor, status='diajukan')
+    else:
+        require(loan_id in state.loans, 'Pinjaman tidak ditemukan')
+        loan = state.loans[loan_id]
+        require(loan['member_id'] == tx.member_id, 'Anggota bukan pemilik pinjaman')
+        if tx.tx_type == 'loan_approval':
+            require(loan['status'] == 'diajukan', 'Pinjaman tidak sedang diajukan')
+            require(tx.amount == loan['amount'], 'Nominal persetujuan tidak cocok')
+            loan['status'] = 'disetujui'
+        elif tx.tx_type == 'loan_disbursement':
+            require(loan['status'] == 'disetujui', 'Pinjaman belum disetujui/sudah dicairkan')
+            require(tx.amount == loan['amount'], 'Nominal pencairan tidak cocok')
+            loan['status'] = 'dicairkan'
+            state.balances[tx.member_id] = balance + tx.amount
+        else:
+            require(loan['status'] == 'dicairkan', 'Pinjaman belum dicairkan/sudah lunas')
+            require(tx.amount <= loan['outstanding'], 'Angsuran melebihi sisa utang')
+            remaining = loan['outstanding'] - tx.amount
+            expected = 0 if remaining == 0 else loan['sisa_tenor'] - 1
+            require(remaining == 0 or expected > 0, 'Angsuran terakhir harus melunasi utang')
+            require(type(tx.extra['sisa_tenor']) is int and tx.extra['sisa_tenor'] == expected,
+                    'Sisa tenor tidak sesuai')
+            loan.update(outstanding=remaining, sisa_tenor=expected)
+            if remaining == 0:
+                loan['status'] = 'lunas'
+    state.seen.add(tx.tx_id)
 
-    if tx.tx_type == "loan_disbursement":
-        loan_id = tx.extra.get("loan_id")
-        loan = loans.get(loan_id)
-        if loan is None or loan["status"] != "disetujui":
-            return False, "DITOLAK: pinjaman belum disetujui / loan_id tidak ditemukan"
 
-    if tx.tx_type == "installment_payment" and tx.extra.get("loan_id") not in loans:
-        return False, "DITOLAK: loan_id tidak ditemukan"
-
-    # Lolos verifikasi -> perbarui salinan ledger lokal Participant Node
-    if tx.tx_type == "deposit":
-        member_balances[tx.member_id] = get_balance(tx.member_id) + tx.amount
-    elif tx.tx_type == "withdrawal":
-        member_balances[tx.member_id] = get_balance(tx.member_id) - tx.amount
-    elif tx.tx_type == "loan_request":
-        loans[tx.extra["loan_id"]] = {
-            "member_id": tx.member_id, "amount": tx.amount,
-            "tenor_bulan": tx.extra["tenor_bulan"], "status": "diajukan",
-            "sisa_tenor": tx.extra["tenor_bulan"],
-        }
-    elif tx.tx_type == "loan_disbursement":
-        loans[tx.extra["loan_id"]]["status"] = "dicairkan"
-        member_balances[tx.member_id] = get_balance(tx.member_id) + tx.amount
-    elif tx.tx_type == "installment_payment":
-        loans[tx.extra["loan_id"]]["sisa_tenor"] = tx.extra["sisa_tenor"]
-
-    return True, "DITERIMA: masuk Mempool"
-
-
-# ============================================================
-# 5. MERKLE ROOT
-# ============================================================
 def compute_merkle_root(transactions):
-    if not transactions:
-        return hashlib.sha256(b"").hexdigest()
-    layer = [
-        hashlib.sha256(json.dumps(tx.to_dict(), sort_keys=True).encode("utf-8")).hexdigest()
-        for tx in transactions
-    ]
+    layer = [digest(tx.to_dict()) for tx in transactions]
+    if not layer:
+        return hashlib.sha256(b'').hexdigest()
     while len(layer) > 1:
-        if len(layer) % 2 == 1:
+        if len(layer) % 2:
             layer.append(layer[-1])
-        layer = [
-            hashlib.sha256((layer[i] + layer[i + 1]).encode("utf-8")).hexdigest()
-            for i in range(0, len(layer), 2)
-        ]
+        layer = [hashlib.sha256(bytes.fromhex(layer[i]) + bytes.fromhex(layer[i+1])).hexdigest()
+                 for i in range(0, len(layer), 2)]
     return layer[0]
 
 
-# ============================================================
-# 6. BLOCK - previous_hash ditautkan terpisah lewat link_block()
-# ============================================================
+@dataclass
 class Block:
-    def __init__(self, index, transactions):
-        self.index = index
-        self.timestamp = time.time()
-        self.previous_hash = None  # belum ditautkan; lihat link_block()
-        self.transactions = transactions
-        self.merkle_root = compute_merkle_root(transactions)
-        self.validator_signatures = []
-        self.block_hash = None
+    index: int
+    transactions: list
+    timestamp: int = field(default_factory=lambda: int(time.time()))
+    previous_hash: str = ZERO_HASH
+    nonce: object = None              # tidak digunakan pada authority-based
+    merkle_root: str = field(init=False)
+    validator_signatures: list = field(default_factory=list)
+    block_hash: str = ''
 
-    def header_dict(self):
-        return {
-            "index": self.index,
-            "timestamp": self.timestamp,
-            "previous_hash": self.previous_hash,
-            "merkle_root": self.merkle_root,
-        }
+    def __post_init__(self):
+        self.transactions = copy.deepcopy(self.transactions)
+        self.merkle_root = compute_merkle_root(self.transactions)
+
+    def header(self):
+        return dict(index=self.index, timestamp=self.timestamp,
+                    previous_hash=self.previous_hash, merkle_root=self.merkle_root,
+                    nonce=self.nonce, network=NETWORK)
 
     def compute_header_hash(self):
-        payload = json.dumps(self.header_dict(), sort_keys=True).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
+        return digest(self.header())
 
 
 def link_block(block, parent_block):
-    """
-    Menautkan block baru ke block induk secara eksplisit - meniru pola
-    'block_B.parent_hash = compute_hash(block_A)' pada Kode 1.13 modul
-    praktikum, bukan langsung dimasukkan saat objek Block dibuat.
-    """
     block.previous_hash = parent_block.block_hash
 
 
-# ============================================================
-# 7. KONSENSUS IBFT
-# ============================================================
-def run_ibft_consensus(block, offline_or_byzantine=None, threshold=2 / 3):
-    offline_or_byzantine = offline_or_byzantine or []
-    header_hash_hex = block.compute_header_hash()
-    header_hash_bytes = bytes.fromhex(header_hash_hex)
-
-    approvals = 0
-    for v_name, keys in validators.items():
-        if v_name in offline_or_byzantine:
-            continue
-        signature = keys["private"].sign(header_hash_bytes, ec.ECDSA(hashes.SHA256()))
-        block.validator_signatures.append({"validator": v_name, "signature": signature.hex()})
-        approvals += 1
-
-    ratio = approvals / len(validators)
-    if ratio >= threshold:
-        block.block_hash = header_hash_hex
-        return True, ratio
-    block.block_hash = None
-    return False, ratio
+def validate_block(block, parent, state, permission_list):
+    require(type(block.index) is int and block.index == (parent.index + 1 if parent else 0),
+            'Urutan index salah')
+    require(block.previous_hash == (parent.block_hash if parent else ZERO_HASH),
+            'Previous hash tidak cocok')
+    require(type(block.timestamp) is int and block.timestamp >= (parent.timestamp if parent else 0),
+            'Timestamp block tidak valid')
+    require(block.nonce is None, 'Nonce tidak digunakan dalam mode authority')
+    require(block.merkle_root == compute_merkle_root(block.transactions), 'Merkle root tidak cocok')
+    if parent is None:
+        require(not block.transactions and block.timestamp == 0, 'Genesis harus kosong dan waktu 0')
+    else:
+        require(bool(block.transactions), 'Block transaksi kosong')
+    working = copy.deepcopy(state)
+    for tx in block.transactions:
+        require(tx.timestamp <= block.timestamp, 'Transaksi lebih baru dari block')
+        apply_transaction(tx, working, permission_list)
+    return working
 
 
-# ============================================================
-# 8. VALIDASI RANTAI
-# ============================================================
-def is_chain_valid(chain, threshold=2 / 3):
-    for i, block in enumerate(chain):
-        if i > 0 and block.previous_hash != chain[i - 1].block_hash:
-            print(f"  ! Block id={block.index}: previous_hash tidak cocok dengan block sebelumnya")
-            return False
-
-        recalculated_merkle = compute_merkle_root(block.transactions)
-        if recalculated_merkle != block.merkle_root:
-            print(f"  ! Block id={block.index}: merkle_root tidak cocok (transaksi dimanipulasi)")
-            return False
-
-        recalculated_header_hash = block.compute_header_hash()
-        if recalculated_header_hash != block.block_hash:
-            print(f"  ! Block id={block.index}: block_hash tidak cocok (header dimanipulasi)")
-            return False
-
-        header_hash_bytes = bytes.fromhex(recalculated_header_hash)
-        valid_sign = 0
-        for entry in block.validator_signatures:
-            v_pub = validators[entry["validator"]]["public"]
-            try:
-                v_pub.verify(bytes.fromhex(entry["signature"]), header_hash_bytes, ec.ECDSA(hashes.SHA256()))
-                valid_sign += 1
-            except InvalidSignature:
-                print(f"  ! Block id={block.index}: signature validator {entry['validator']} tidak sah")
-                return False
-        if valid_sign / len(validators) < threshold:
-            print(f"  ! Block id={block.index}: validator_signatures tidak mencapai ambang 66% "
-                  f"({valid_sign}/{len(validators)})")
-            return False
-
-    return True
+def verify_certificate(block, validator_public):
+    require(block.block_hash == block.compute_header_hash(), 'Hash header tidak cocok')
+    unique = set()
+    for seal in block.validator_signatures:
+        name = seal['validator']
+        require(name in validator_public and name not in unique,
+                'Validator asing atau signature validator duplikat')
+        require(verify(validator_public[name], seal['signature'], canonical(block.header())),
+                'Signature validator tidak valid')
+        unique.add(name)
+    require(len(unique) >= QUORUM, 'Kuorum minimal 3 validator unik tidak tercapai')
 
 
-# ============================================================
-# 9. OBSERVER NODE & AUDITOR - akses read-only (Bagian 1.2 & Diagram Arsitektur)
-# ============================================================
+def replay_chain(chain, permission_list, validator_public, trusted_genesis):
+    """Rekonstruksi state dari genesis; audit isi, signature, urutan dan kuorum."""
+    require(bool(chain), 'Chain kosong')
+    require(chain[0].block_hash == trusted_genesis, 'Genesis tidak dikenal')
+    state, parent = State(), None
+    for block in chain:
+        state = validate_block(block, parent, state, permission_list)
+        verify_certificate(block, validator_public)
+        parent = block
+    return state
+
+
+class ValidatorNode:
+    def __init__(self, name, wallet, permission_list, validator_public):
+        self.name, self.wallet = name, wallet
+        self.permission_list = copy.deepcopy(permission_list)
+        self.validator_public = copy.deepcopy(validator_public)
+        self.chain = []
+
+    def approve(self, candidate, trusted_genesis):
+        state = replay_chain(self.chain, self.permission_list, self.validator_public, trusted_genesis)
+        validate_block(candidate, self.chain[-1], state, self.permission_list)
+        return dict(validator=self.name, signature=self.wallet.sign(canonical(candidate.header())))
+
+
 class ObserverNode:
-    """
-    Node non-validator yang menyimpan salinan ledger untuk Auditor.
-    Disinkronkan setelah block final di-commit Validator (langkah 6 pada
-    Diagram Arsitektur Beranotasi). Tidak punya method untuk mengubah ledger.
-    """
-    def __init__(self):
-        self.synced_chain = []
+    def __init__(self, permission_list, validator_public, trusted_genesis):
+        self._permission_list = copy.deepcopy(permission_list)
+        self._validator_public = copy.deepcopy(validator_public)
+        self._genesis = trusted_genesis
+        self._chain = []
 
     def sync(self, chain):
-        self.synced_chain = list(chain)
+        replay_chain(chain, self._permission_list, self._validator_public, self._genesis)
+        self._chain = copy.deepcopy(chain)
+
+    def snapshot(self):
+        return copy.deepcopy(self._chain)
 
     def get_transaction_history(self, member_id):
-        history = []
-        for block in self.synced_chain:
-            for tx in block.transactions:
-                if tx.member_id == member_id:
-                    history.append(tx.to_dict())
-        return history
+        return [tx.to_dict() for b in self._chain for tx in b.transactions if tx.member_id == member_id]
 
-    def get_transaction_objects(self, member_id):
-        """Sama seperti get_transaction_history, tapi mengembalikan objek
-        Transaction (bukan dict) supaya bisa ditampilkan ringkas di terminal."""
-        return [tx for block in self.synced_chain for tx in block.transactions
-                if tx.member_id == member_id]
+    def verify_integrity(self):
+        replay_chain(self._chain, self._permission_list, self._validator_public, self._genesis)
+        return True
 
 
 class Auditor:
-    """
-    Auditor (akuntan publik, OJK/Dinas Koperasi, anggota koperasi): hanya
-    memiliki akses baca lewat Observer Node, tanpa kemampuan mengubah status
-    blockchain (Bagian 1.2 laporan).
-    """
-    def __init__(self, auditor_id, observer_node):
-        self.auditor_id = auditor_id
-        self.observer_node = observer_node
-
-    def verify_ledger_integrity(self):
-        return is_chain_valid(self.observer_node.synced_chain)
+    def __init__(self, observer):
+        self.observer = observer
 
     def inspect_member_history(self, member_id):
-        return self.observer_node.get_transaction_history(member_id)
+        return self.observer.get_transaction_history(member_id)
 
-    def inspect_member_history_objects(self, member_id):
-        return self.observer_node.get_transaction_objects(member_id)
-
-
-# ============================================================
-# 10. HELPER TAMPILAN - supaya output terminal rapi dan mudah dibaca
-# ============================================================
-LINE_WIDTH = 64
-TX_LABEL = {
-    "deposit": "Setoran",
-    "withdrawal": "Penarikan",
-    "loan_request": "Pengajuan pinjaman",
-    "loan_disbursement": "Pencairan pinjaman",
-    "installment_payment": "Angsuran",
-}
+    def verify_ledger_integrity(self):
+        return self.observer.verify_integrity()
 
 
-def rp(amount):
-    """Format angka jadi Rp x.xxx.xxx."""
-    return "Rp" + f"{amount:,.0f}".replace(",", ".")
+class KoperasiBlockchain:
+    def __init__(self):
+        self.teller = Wallet()
+        # Konfigurasi keanggotaan tepercaya untuk sesi praktikum ini.
+        self.permission_list = {'TELLER-01': self.teller.public_pem}
+        wallets = {name: Wallet() for name in VALIDATOR_NAMES}
+        self.validator_public = {name: w.public_pem for name, w in wallets.items()}
+        genesis = Block(0, [], timestamp=0)
+        genesis.block_hash = genesis.compute_header_hash()
+        genesis.validator_signatures = [dict(validator=name, signature=w.sign(canonical(genesis.header())))
+                                        for name, w in wallets.items()]
+        self.trusted_genesis = genesis.block_hash
+        self.chain = [genesis]
+        self.state = State()
+        self.mempool = []
+        self.nodes = [ValidatorNode(name, w, self.permission_list, self.validator_public)
+                      for name, w in wallets.items()]
+        for node in self.nodes:
+            node.chain = copy.deepcopy(self.chain)
+        self.observer = ObserverNode(self.permission_list, self.validator_public, self.trusted_genesis)
+        self.observer.sync(self.chain)
+
+    def pending_state(self):
+        state = copy.deepcopy(self.state)
+        for tx in self.mempool:
+            apply_transaction(tx, state, self.permission_list)
+        return state
+
+    def make_transaction(self, kind, member, amount, extra=None):
+        if kind == 'withdrawal' and extra is None:
+            before = self.pending_state().balances.get(member, 0)
+            extra = dict(saldo_sebelum=before, saldo_sesudah=before - amount)
+        return Transaction(kind, member, amount, 'TELLER-01', copy.deepcopy(extra or {})).sign(self.teller)
+
+    def submit(self, tx):
+        working = self.pending_state()
+        require(tx.timestamp <= int(time.time()), 'Waktu transaksi di masa depan')
+        apply_transaction(tx, working, self.permission_list)
+        self.mempool.append(copy.deepcopy(tx))
+        # self.state tidak berubah: saldo final hanya berubah pada commit.
+
+    def propose_block(self):
+        require(bool(self.mempool), 'Mempool kosong')
+        candidate = Block(self.chain[-1].index + 1, self.mempool,
+                          timestamp=max(int(time.time()), self.chain[-1].timestamp))
+        link_block(candidate, self.chain[-1])
+        return candidate
+
+    def commit_candidate(self, block):
+        new_state = validate_block(block, self.chain[-1], self.state, self.permission_list)
+        verify_certificate(block, self.validator_public)
+        # Semua pemeriksaan harus berhasil sebelum state final berubah.
+        self.chain.append(copy.deepcopy(block))
+        self.state = new_state
+        committed_ids = {tx.tx_id for tx in block.transactions}
+        remaining = [tx for tx in self.mempool if tx.tx_id not in committed_ids]
+        self.mempool = []
+        for tx in remaining:
+            try:
+                self.submit(tx)  # validasi ulang antrean terhadap state terbaru
+            except ValueError:
+                pass
+        self.observer.sync(self.chain)
+
+    def run_authority_consensus(self, offline=()):
+        """Simulasi lokal: validasi independen + 3 tanda tangan unik. Bukan IBFT."""
+        block = self.propose_block()
+        online = [n for n in self.nodes if n.name not in offline]
+        for node in online:
+            # Catch-up sebelum voting; salinan berbeda untuk setiap node.
+            replay_chain(self.chain, node.permission_list, node.validator_public, self.trusted_genesis)
+            node.chain = copy.deepcopy(self.chain)
+            try:
+                block.validator_signatures.append(node.approve(block, self.trusted_genesis))
+            except ValueError:
+                continue
+        count = len(block.validator_signatures)
+        if count < QUORUM:
+            return False, count    # mempool tetap; saldo dan chain final tidak berubah
+        block.block_hash = block.compute_header_hash()
+        self.commit_candidate(block)
+        for node in online:
+            node.chain = copy.deepcopy(self.chain)
+        return True, count
 
 
-def section(title):
-    print("\n" + "-" * LINE_WIDTH)
-    print(f" {title}")
-    print("-" * LINE_WIDTH)
+def mine_pow(payload, parent_hash, difficulty=3, max_tries=1_000_000):
+    """Latihan PoW TERPISAH dari chain authority; difficulty jumlah nol di depan."""
+    require(type(difficulty) is int and 1 <= difficulty <= 5, 'Difficulty harus 1..5')
+    block = dict(payload=copy.deepcopy(payload), previous_hash=parent_hash, nonce=0)
+    for nonce in range(max_tries):
+        block['nonce'] = nonce
+        block_hash = digest(block)
+        if block_hash.startswith('0' * difficulty):
+            return block, block_hash
+    raise ValueError('Nonce belum ditemukan dalam batas percobaan')
 
 
-def status_line(ok, tag, keterangan=""):
-    mark = "OK " if ok else "TOLAK"
-    line = f"  [{mark}] {tag}"
-    if keterangan:
-        line += f"  ({keterangan})"
-    print(line)
+def demo_pow():
+    print('LATIHAN MODUL: PoW sederhana (terpisah dari konsensus koperasi)')
+    block, saved = mine_pow({'jenis': 'deposit', 'anggota': 'AGT-001', 'nominal': 500000}, ZERO_HASH)
+    print('Difficulty: 3 nol | Nonce:', block['nonce'], '| Hash:', saved)
+    print('Valid:', digest(block) == saved and saved.startswith('000'))
+    block['payload']['nominal'] = 50000000
+    print('Setelah nominal dimanipulasi:', digest(block) == saved and digest(block).startswith('000'))
 
 
-def block_result_line(block_label, committed, ratio, n_approve, n_total):
-    hasil = "SAH & FINAL" if committed else "DITOLAK"
-    print(f"  -> Konsensus IBFT {block_label}: {hasil}  "
-          f"[{n_approve}/{n_total} validator setuju, {ratio:.0%}]")
+def demo():
+    app = KoperasiBlockchain()
+    print('BLOCKCHAIN KOPERASI - PRAKTIKUM 1')
+    print('Simulasi authority-based lokal, kuorum 3/4. BUKAN IBFT lengkap.')
+
+    def send(kind, member, amount, extra=None):
+        tx = app.make_transaction(kind, member, amount, extra)
+        app.submit(tx)
+        print('  MEMPOOL:', kind, member, f'Rp{amount:,}', extra or '')
+        return tx
+
+    def commit(offline=()):
+        ok, count = app.run_authority_consensus(offline)
+        print(f'  KONSENSUS: {count}/4 ({count/4:.0%}),', 'DITERIMA' if ok else 'DITOLAK')
+        print('  Saldo FINAL:', app.state.balances)
+        return ok
+
+    print('\n1. SETORAN DAN PENARIKAN -> BLOCK 1')
+    tx1 = send('deposit', 'AGT-001', 500000)
+    send('withdrawal', 'AGT-001', 100000)
+    print('  Sebelum commit, saldo final AGT-001:', app.state.balances.get('AGT-001', 0))
+    commit()
+
+    print('\n2. PENGAJUAN, PERSETUJUAN DAN PENCAIRAN -> BLOCK 2')
+    send('loan_request', 'AGT-002', 2000000,
+         dict(loan_id='PINJ-001', tenor_bulan=12, status='diajukan'))
+    send('loan_approval', 'AGT-002', 2000000, dict(loan_id='PINJ-001'))
+    send('loan_disbursement', 'AGT-002', 2000000, dict(loan_id='PINJ-001'))
+    commit()
+
+    print('\n3. ANGSURAN TUNAI -> BLOCK 3; SATU VALIDATOR OFFLINE')
+    send('installment_payment', 'AGT-002', 180000, dict(loan_id='PINJ-001', sisa_tenor=11))
+    commit(VALIDATOR_NAMES[-1:])
+    print('  Pinjaman:', app.state.loans['PINJ-001'])
+    auditor = Auditor(app.observer)
+    print('\n4. AUDITOR: INTEGRITAS =', auditor.verify_ledger_integrity())
+    for tx in auditor.inspect_member_history('AGT-002'):
+        print(' ', tx['tx_type'], tx['amount'], tx['extra'])
+
+    print('\n5. UJI MANIPULASI PADA SALINAN CHAIN')
+    altered = app.observer.snapshot()
+    altered[1].transactions[0].amount = 50000000
+    try:
+        replay_chain(altered, app.permission_list, app.validator_public, app.trusted_genesis)
+    except ValueError as exc:
+        print('  TERDETEKSI:', exc)
+    print('  Chain asli tetap valid:', auditor.verify_ledger_integrity())
+
+    print('\n6. UJI OPERATOR ASING, PENYAMARAN DAN REPLAY')
+    rogue = Wallet()
+    attempts = [Transaction('deposit', 'AGT-003', 100000, 'TELLER-ROGUE').sign(rogue),
+                Transaction('deposit', 'AGT-003', 100000, 'TELLER-01').sign(rogue), tx1]
+    for tx in attempts:
+        try:
+            app.submit(tx)
+        except ValueError as exc:
+            print('  DITOLAK:', exc)
+
+    print('\n7. KUORUM GAGAL: 1/4 VALIDATOR; SALDO TIDAK BOLEH BERUBAH')
+    send('deposit', 'AGT-004', 300000)
+    commit(VALIDATOR_NAMES[1:])
+    print('  Saldo FINAL AGT-004:', app.state.balances.get('AGT-004', 0))
+    print('  Transaksi tetap menunggu di mempool:', len(app.mempool))
+    print('\n8. COBA ULANG SAAT VALIDATOR KEMBALI ONLINE')
+    commit()
+    print('  Seluruh salinan validator valid:', all(
+        replay_chain(n.chain, n.permission_list, n.validator_public, app.trusted_genesis) == app.state
+        for n in app.nodes))
+    print('  Audit akhir:', auditor.verify_ledger_integrity())
+    print('\nOpsi lain: --test untuk uji otomatis; --pow-demo untuk latihan nonce modul.')
 
 
-def print_tx_summary(tx):
-    """Satu baris ringkas per transaksi, tanpa signature hex yang panjang."""
-    label = TX_LABEL.get(tx.tx_type, tx.tx_type)
-    detail = f"{label:<20} {tx.member_id:<9} {rp(tx.amount):>14}"
-    if tx.tx_type == "withdrawal":
-        detail += f"   saldo {rp(tx.extra['saldo_sebelum'])} -> {rp(tx.extra['saldo_sesudah'])}"
-    elif tx.tx_type == "loan_request":
-        detail += f"   {tx.extra['loan_id']}, tenor {tx.extra['tenor_bulan']} bln, status: {tx.extra['status']}"
-    elif tx.tx_type == "loan_disbursement":
-        detail += f"   {tx.extra['loan_id']}"
-    elif tx.tx_type == "installment_payment":
-        detail += f"   {tx.extra['loan_id']}, sisa tenor: {tx.extra['sisa_tenor']} bln"
-    print("    " + detail)
+class RegressionTests(unittest.TestCase):
+    """Uji perilaku penting, termasuk serangan yang lolos di versi sebelumnya."""
+    def setUp(self):
+        self.app = KoperasiBlockchain()
+
+    def deposit(self, amount=500000):
+        tx = self.app.make_transaction('deposit', 'AGT-001', amount)
+        self.app.submit(tx)
+        return tx
+
+    def test_final_state_only_after_quorum(self):
+        self.deposit()
+        self.assertEqual(self.app.state.balances, {})
+        for offline in (VALIDATOR_NAMES[1:], VALIDATOR_NAMES[2:]):
+            self.assertFalse(self.app.run_authority_consensus(offline)[0])
+            self.assertEqual(self.app.state.balances, {})
+            self.assertEqual(len(self.app.chain), 1)
+        self.assertTrue(self.app.run_authority_consensus(VALIDATOR_NAMES[-1:])[0])
+        self.assertEqual(self.app.state.balances['AGT-001'], 500000)
+        self.assertEqual(len(self.app.mempool), 0)
+
+    def test_identity_binding_and_unknown_operator(self):
+        rogue = Wallet()
+        for operator in ('TELLER-01', 'ROGUE'):
+            with self.assertRaises(ValueError):
+                self.app.submit(Transaction('deposit', 'A', 1, operator).sign(rogue))
+
+    def test_replay_pending_and_committed(self):
+        tx = self.deposit()
+        with self.assertRaises(ValueError):
+            self.app.submit(tx)
+        self.app.run_authority_consensus()
+        with self.assertRaises(ValueError):
+            self.app.submit(tx)
+
+    def test_invalid_amount_type_and_transaction_type(self):
+        for amount in (0, -10, 1.5, True):
+            with self.assertRaises(ValueError):
+                self.app.submit(self.app.make_transaction('deposit', 'A', amount))
+        with self.assertRaises(ValueError):
+            self.app.submit(self.app.make_transaction('unknown', 'A', 10))
+
+    def test_pending_double_spend_and_balance_metadata(self):
+        self.deposit(100)
+        self.app.submit(self.app.make_transaction('withdrawal', 'AGT-001', 80))
+        with self.assertRaises(ValueError):
+            self.app.submit(self.app.make_transaction('withdrawal', 'AGT-001', 30))
+        with self.assertRaises(ValueError):
+            self.app.submit(self.app.make_transaction('withdrawal', 'AGT-001', 10,
+                            dict(saldo_sebelum=999, saldo_sesudah=989)))
+
+    def test_validator_rejects_tampered_candidate(self):
+        self.deposit()
+        block = self.app.propose_block()
+        block.transactions[0].amount = 999
+        block.merkle_root = compute_merkle_root(block.transactions)
+        for node in self.app.nodes:
+            with self.assertRaises(ValueError):
+                node.approve(block, self.app.trusted_genesis)
+
+    def test_duplicate_validator_seals_rejected(self):
+        self.deposit()
+        block = self.app.propose_block()
+        seal = self.app.nodes[0].approve(block, self.app.trusted_genesis)
+        block.validator_signatures = [seal, seal, seal]
+        block.block_hash = block.compute_header_hash()
+        with self.assertRaises(ValueError):
+            self.app.commit_candidate(block)
+        self.assertEqual(self.app.state.balances, {})
+
+    def test_audit_tampering_and_observer_isolation(self):
+        tx = self.deposit()
+        tx.amount = 1  # mempool harus menyimpan salinan
+        self.app.run_authority_consensus()
+        for change in ('payload', 'header', 'parent', 'signature'):
+            chain = self.app.observer.snapshot()
+            block = chain[-1]
+            if change == 'payload':
+                block.transactions[0].amount = 1
+            elif change == 'header':
+                block.timestamp += 1
+            elif change == 'parent':
+                block.previous_hash = ZERO_HASH
+            else:
+                block.validator_signatures[0]['signature'] = '00'
+            with self.assertRaises(ValueError):
+                replay_chain(chain, self.app.permission_list, self.app.validator_public,
+                             self.app.trusted_genesis)
+        history = self.app.observer.get_transaction_history('AGT-001')
+        history[0]['extra']['fake'] = 1
+        self.assertTrue(self.app.observer.verify_integrity())
+        self.assertIsNot(self.app.nodes[0].chain[-1], self.app.nodes[1].chain[-1])
+        self.assertEqual(self.app.state.balances['AGT-001'], 500000)
+
+    def test_loan_lifecycle_and_rules(self):
+        def send(kind, member='A', amount=100, **extra):
+            self.app.submit(self.app.make_transaction(kind, member, amount, extra))
+        send('loan_request', loan_id='L1', tenor_bulan=2, status='diajukan')
+        with self.assertRaises(ValueError):
+            send('loan_disbursement', loan_id='L1')
+        send('loan_approval', loan_id='L1')
+        for member, amount in (('B', 100), ('A', 999)):
+            with self.assertRaises(ValueError):
+                send('loan_disbursement', member, amount, loan_id='L1')
+        send('loan_disbursement', loan_id='L1')
+        with self.assertRaises(ValueError):
+            send('loan_disbursement', loan_id='L1')
+        send('installment_payment', amount=40, loan_id='L1', sisa_tenor=1)
+        with self.assertRaises(ValueError):
+            send('installment_payment', amount=20, loan_id='L1', sisa_tenor=0)
+        send('installment_payment', amount=60, loan_id='L1', sisa_tenor=0)
+        self.app.run_authority_consensus()
+        self.assertEqual(self.app.state.loans['L1']['status'], 'lunas')
+        self.assertEqual(self.app.state.loans['L1']['outstanding'], 0)
+        self.assertEqual(self.app.state.balances['A'], 100)
+        self.assertEqual(replay_chain(self.app.chain, self.app.permission_list,
+                                     self.app.validator_public, self.app.trusted_genesis), self.app.state)
+
+    def test_pow_exercise(self):
+        block, saved = mine_pow({'deposit': 100}, ZERO_HASH, difficulty=2)
+        self.assertTrue(saved.startswith('00'))
+        self.assertEqual(saved, digest(block))
+        block['payload']['deposit'] = 999
+        self.assertNotEqual(saved, digest(block))
 
 
-# ============================================================
-# 11. DEMO / SKENARIO SESUAI DOKUMEN DESAIN
-# ============================================================
-if __name__ == "__main__":
-    n_validators = len(validators)
-
-    section("TAHAP 1 - Setoran & Penarikan Simpanan (Block A)")
-    tx1 = make_deposit("AGT-001", 500000, "TELLER-01", teller_private)
-    ok, msg = participant_node_verify(tx1, teller_public)
-    status_line(ok, f"Setoran {rp(tx1.amount)} - {tx1.member_id}")
-
-    tx2 = make_withdrawal("AGT-001", 100000, "TELLER-01", teller_private)
-    ok, msg = participant_node_verify(tx2, teller_public)
-    status_line(ok, f"Penarikan {rp(tx2.amount)} - {tx2.member_id}",
-                f"saldo {rp(tx2.extra['saldo_sebelum'])} -> {rp(tx2.extra['saldo_sesudah'])}")
-
-    block_A = Block(index=1, transactions=[tx1, tx2])
-    block_A.previous_hash = "0" * 64  # genesis block, tidak memiliki induk
-    committed, ratio = run_ibft_consensus(block_A)
-    block_result_line("Block A", committed, ratio, round(ratio * n_validators), n_validators)
-
-    section("TAHAP 2 - Pengajuan & Pencairan Pinjaman (Block B)")
-    tx3 = make_loan_request("AGT-002", 2000000, 12, "TELLER-01", teller_private)
-    ok, msg = participant_node_verify(tx3, teller_public)
-    status_line(ok, f"Pengajuan pinjaman {rp(tx3.amount)} - {tx3.member_id}", f"loan_id {tx3.extra['loan_id']}")
-
-    approve_loan(tx3.extra["loan_id"])  # disetujui Operator berwenang sebelum dicairkan
-    tx4 = make_loan_disbursement("AGT-002", 2000000, tx3.extra["loan_id"], "TELLER-01", teller_private)
-    ok, msg = participant_node_verify(tx4, teller_public)
-    status_line(ok, f"Pencairan pinjaman {rp(tx4.amount)} - {tx4.member_id}", f"loan_id {tx4.extra['loan_id']}")
-
-    block_B = Block(index=2, transactions=[tx3, tx4])
-    link_block(block_B, block_A)  # eksplisit, meniru pola modul
-    committed, ratio = run_ibft_consensus(block_B)
-    block_result_line("Block B", committed, ratio, round(ratio * n_validators), n_validators)
-
-    section("TAHAP 3 - Pembayaran Angsuran (Block C)")
-    tx5 = make_installment("AGT-002", tx3.extra["loan_id"], 180000, 11, "TELLER-01", teller_private)
-    ok, msg = participant_node_verify(tx5, teller_public)
-    status_line(ok, f"Angsuran {rp(tx5.amount)} - {tx5.member_id}", f"sisa tenor {tx5.extra['sisa_tenor']} bln")
-
-    block_C = Block(index=3, transactions=[tx5])
-    link_block(block_C, block_B)
-    committed, ratio = run_ibft_consensus(block_C)
-    block_result_line("Block C", committed, ratio, round(ratio * n_validators), n_validators)
-
-    chain = [block_A, block_B, block_C]
-
-    section("SINKRONISASI KE OBSERVER NODE & VERIFIKASI AUDITOR")
-    observer = ObserverNode()
-    observer.sync(chain)
-    auditor = Auditor("AUD-01", observer)
-
-    print("  Riwayat transaksi AGT-002 (dibaca Auditor lewat Observer Node):")
-    for tx in auditor.inspect_member_history_objects("AGT-002"):
-        print_tx_summary(tx)
-    print(f"\n  Verifikasi integritas ledger oleh Auditor -> "
-          f"{'VALID' if auditor.verify_ledger_integrity() else 'TIDAK VALID'}")
-
-    section("SKENARIO UJI 1 - Manipulasi Isi Transaksi pada Block A")
-    print(f"  Sebelum manipulasi -> chain valid: {is_chain_valid(chain)}")
-    tx1.amount = 50000000
-    print("  Nominal setoran AGT-001 diubah paksa jadi", rp(tx1.amount), "(tanpa prosedur resmi)")
-    print(f"  Sesudah manipulasi -> chain valid: {is_chain_valid(chain)}")
-    tx1.amount = 500000  # kembalikan agar skenario berikutnya bersih
-    block_A.merkle_root = compute_merkle_root(block_A.transactions)
-
-    section("SKENARIO UJI 2 - Transaksi dari Operator Tidak Terdaftar")
-    tx_rogue = Transaction("withdrawal", "AGT-003", 1000000, "TELLER-ROGUE")
-    tx_rogue.sign(rogue_private)
-    ok, msg = participant_node_verify(tx_rogue, rogue_public)
-    status_line(ok, f"Penarikan {rp(tx_rogue.amount)} - operator TELLER-ROGUE", msg)
-
-    section("SKENARIO UJI 3 - Validator Gagal Mencapai Ambang 66%")
-    tx6 = make_deposit("AGT-004", 300000, "TELLER-01", teller_private)
-    participant_node_verify(tx6, teller_public)
-
-    block_D = Block(index=4, transactions=[tx6])
-    link_block(block_D, block_C)
-    offline = ["Pengurus Koperasi", "Pengurus Pengawas", "Otoritas Konsorsium"]
-    committed, ratio = run_ibft_consensus(block_D, offline_or_byzantine=offline)
-    print(f"  Validator offline/tidak setuju: {', '.join(offline)}")
-    block_result_line("Block D", committed, ratio, round(ratio * n_validators), n_validators)
-    if committed:
-        chain.append(block_D)
-        observer.sync(chain)
-        print(f"  Chain valid setelah Block D -> {auditor.verify_ledger_integrity()}")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--test', action='store_true', help='Jalankan uji regresi')
+    mode.add_argument('--pow-demo', action='store_true', help='Latihan PoW terpisah sesuai modul')
+    args = parser.parse_args()
+    if args.test:
+        unittest.main(argv=['blockchain_koperasi.py'], verbosity=2)
+    elif args.pow_demo:
+        demo_pow()
     else:
-        print("  Block D tidak ditambahkan ke ledger (kuorum validator tidak tercapai)")
-
-    print("\n" + "=" * LINE_WIDTH)
+        demo()
