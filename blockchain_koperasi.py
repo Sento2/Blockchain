@@ -4,11 +4,10 @@ JALANKAN:
     python -m pip install cryptography
     python blockchain_koperasi.py              # presentasi/demo koperasi
     python blockchain_koperasi.py --test       # uji regresi otomatis
-    python blockchain_koperasi.py --pow-demo   # latihan PoW modul, terpisah
 
 PADANAN MODUL:
     class Block; link_block (parent hash); replay_chain (deteksi manipulasi);
-    Wallet/Transaction (private-public key, sign-verify); mine_pow (nonce).
+    Wallet/Transaction (private-public key, sign-verify).
 
 CAKUPAN: simulasi authority-based dengan 4 validator, kuorum 3 tanda tangan
 unik. Setiap validator memeriksa kandidat terhadap salinan chain sendiri.
@@ -23,8 +22,8 @@ ATURAN BISNIS DEMO:
   mendebit saldo simpanan. Setiap pembayaran mengurangi tenor satu periode;
   angsuran periode terakhir harus melunasi sisa utang.
 - loan_approval ditambahkan sebagai transaksi agar persetujuan dapat diaudit.
-- Genesis kosong ditandatangani 4 validator. Nonce block authority bernilai
-  None: tidak digunakan karena tidak ada penambangan PoW di alur utama.
+- Genesis kosong ditandatangani 4 validator. Pengesahan block menggunakan
+  kuorum tanda tangan validator sesuai desain koperasi.
 
 BATASAN/TARGET TUGAS BESAR: penyimpanan permanen, keystore terenkripsi,
 rotasi/pencabutan kunci melalui tata kelola, jaringan antarnode, IBFT lengkap,
@@ -217,7 +216,6 @@ class Block:
     transactions: list
     timestamp: int = field(default_factory=lambda: int(time.time()))
     previous_hash: str = ZERO_HASH
-    nonce: object = None              # tidak digunakan pada authority-based
     merkle_root: str = field(init=False)
     validator_signatures: list = field(default_factory=list)
     block_hash: str = ''
@@ -229,7 +227,7 @@ class Block:
     def header(self):
         return dict(index=self.index, timestamp=self.timestamp,
                     previous_hash=self.previous_hash, merkle_root=self.merkle_root,
-                    nonce=self.nonce, network=NETWORK)
+                    network=NETWORK)
 
     def compute_header_hash(self):
         return digest(self.header())
@@ -246,7 +244,6 @@ def validate_block(block, parent, state, permission_list):
             'Previous hash tidak cocok')
     require(type(block.timestamp) is int and block.timestamp >= (parent.timestamp if parent else 0),
             'Timestamp block tidak valid')
-    require(block.nonce is None, 'Nonce tidak digunakan dalam mode authority')
     require(block.merkle_root == compute_merkle_root(block.transactions), 'Merkle root tidak cocok')
     if parent is None:
         require(not block.transactions and block.timestamp == 0, 'Genesis harus kosong dan waktu 0')
@@ -416,27 +413,6 @@ class KoperasiBlockchain:
         return True, count
 
 
-def mine_pow(payload, parent_hash, difficulty=3, max_tries=1_000_000):
-    """Latihan PoW TERPISAH dari chain authority; difficulty jumlah nol di depan."""
-    require(type(difficulty) is int and 1 <= difficulty <= 5, 'Difficulty harus 1..5')
-    block = dict(payload=copy.deepcopy(payload), previous_hash=parent_hash, nonce=0)
-    for nonce in range(max_tries):
-        block['nonce'] = nonce
-        block_hash = digest(block)
-        if block_hash.startswith('0' * difficulty):
-            return block, block_hash
-    raise ValueError('Nonce belum ditemukan dalam batas percobaan')
-
-
-def demo_pow():
-    print('LATIHAN MODUL: PoW sederhana (terpisah dari konsensus koperasi)')
-    block, saved = mine_pow({'jenis': 'deposit', 'anggota': 'AGT-001', 'nominal': 500000}, ZERO_HASH)
-    print('Difficulty: 3 nol | Nonce:', block['nonce'], '| Hash:', saved)
-    print('Valid:', digest(block) == saved and saved.startswith('000'))
-    block['payload']['nominal'] = 50000000
-    print('Setelah nominal dimanipulasi:', digest(block) == saved and digest(block).startswith('000'))
-
-
 def demo():
     app = KoperasiBlockchain()
     print('BLOCKCHAIN KOPERASI - PRAKTIKUM 1')
@@ -506,7 +482,7 @@ def demo():
         replay_chain(n.chain, n.permission_list, n.validator_public, app.trusted_genesis) == app.state
         for n in app.nodes))
     print('  Audit akhir:', auditor.verify_ledger_integrity())
-    print('\nOpsi lain: --test untuk uji otomatis; --pow-demo untuk latihan nonce modul.')
+    print('\nOpsi lain: --test untuk uji otomatis.')
 
 
 class RegressionTests(unittest.TestCase):
@@ -627,23 +603,12 @@ class RegressionTests(unittest.TestCase):
         self.assertEqual(replay_chain(self.app.chain, self.app.permission_list,
                                      self.app.validator_public, self.app.trusted_genesis), self.app.state)
 
-    def test_pow_exercise(self):
-        block, saved = mine_pow({'deposit': 100}, ZERO_HASH, difficulty=2)
-        self.assertTrue(saved.startswith('00'))
-        self.assertEqual(saved, digest(block))
-        block['payload']['deposit'] = 999
-        self.assertNotEqual(saved, digest(block))
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument('--test', action='store_true', help='Jalankan uji regresi')
-    mode.add_argument('--pow-demo', action='store_true', help='Latihan PoW terpisah sesuai modul')
+    parser.add_argument('--test', action='store_true', help='Jalankan uji regresi')
     args = parser.parse_args()
     if args.test:
         unittest.main(argv=['blockchain_koperasi.py'], verbosity=2)
-    elif args.pow_demo:
-        demo_pow()
     else:
         demo()
